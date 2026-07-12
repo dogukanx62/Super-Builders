@@ -281,6 +281,18 @@ jobs:
           # silently.
           sed -i '/CONFIG_KPM/d' "$GITHUB_WORKSPACE/wild_gki.fragment"
 
+          # Super-Builders' android14-6.1 SUSFS fragment currently contains
+          # two legacy AUTO_ADD symbols that are not declared by the current
+          # KernelSU-Next/SUSFS Kconfig patch. Kleaf treats unknown fragment
+          # symbols as a hard error instead of silently ignoring them.
+          sed -i \
+            -e '/^CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=/d' \
+            -e '/^CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=/d' \
+            "$GITHUB_WORKSPACE/wild_gki.fragment"
+
+          echo "Final wild_gki.fragment:"
+          cat "$GITHUB_WORKSPACE/wild_gki.fragment"
+
       # ----------------------------------------------------------------
       # 7. Every KernelSU kernel needs this, regardless of source tree -
       #    KSU's hooks add symbols the frozen KMI export list doesn't
@@ -438,3 +450,4 @@ jobs:
             echo "| Patch rejects | ${REJ_COUNT:-0} |"
             echo "| Signed boot.img built | ${{ inputs.build_signed_bootimg }} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
