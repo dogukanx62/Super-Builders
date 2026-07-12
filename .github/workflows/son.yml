@@ -43,11 +43,18 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      ksu_next_branch:
-        description: "KernelSU-Next upstream branch"
-        type: choice
-        options: [stable, dev]
-        default: stable
+      ksu_next_ref:
+        description: >-
+          KernelSU-Next commit/tag/branch to build against. Default is
+          pinned to the last commit before upstream's 2026-06-18 sucompat
+          refactor (PR #3521), which is the last point where
+          Super-Builders' 70_ksu_safety patch applies with zero rejects
+          (verified by bisecting the actual upstream history). Passing
+          "stable" or "dev" tracks the live branch instead and may hit
+          the same class of patch-reject failure again as upstream moves
+          further - only do this if you're ready to re-diagnose/re-pin.
+        type: string
+        default: ddeecfd4ca5664b70b2434a7de99522b7dde658d
       apply_enhanced_susfs:
         description: "Apply Super-Builders 51_enhanced_susfs patch"
         type: boolean
@@ -175,10 +182,17 @@ jobs:
       - name: Set up KernelSU-Next
         working-directory: ${{ github.workspace }}/kernel/aosp
         run: |
-          BRANCH="${{ inputs.ksu_next_branch || 'stable' }}"
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${BRANCH}/kernel/setup.sh" | bash -s "$BRANCH"
+          REF="${{ inputs.ksu_next_ref || 'ddeecfd4ca5664b70b2434a7de99522b7dde658d' }}"
+          echo "Building KernelSU-Next @ $REF"
+          # setup.sh itself is fetched FROM the same ref, not from a
+          # floating branch - this makes the whole step fully
+          # reproducible: same ref in, same source tree out, every time.
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${REF}/kernel/setup.sh" | bash -s "$REF"
           test -d KernelSU-Next || { echo "::error::KernelSU-Next/ was not created by setup.sh"; exit 1; }
+          RESOLVED="$(cd KernelSU-Next && git rev-parse HEAD)"
+          echo "Resolved to commit: $RESOLVED"
           echo "KSU_DIR=$GITHUB_WORKSPACE/kernel/aosp/KernelSU-Next" >> "$GITHUB_ENV"
+          echo "KSU_RESOLVED_COMMIT=$RESOLVED" >> "$GITHUB_ENV"
           echo "CONFIG_KSU=y" >> "$GITHUB_WORKSPACE/wild_gki.fragment"
 
       # ----------------------------------------------------------------
@@ -215,7 +229,16 @@ jobs:
         run: |
           PATCH="$GITHUB_WORKSPACE/super-builders/$SB_PATCH_DIR/70_ksu_safety-kernelsu-next-${KERNEL_VER}.patch"
           if [ -s "$PATCH" ]; then
-            patch -p1 --no-backup-if-mismatch < "$PATCH"
+            if ! patch -p1 -F3 --no-backup-if-mismatch < "$PATCH"; then
+              echo "::error::70_ksu_safety failed against KernelSU-Next @ $KSU_RESOLVED_COMMIT."
+              echo "::error::This patch is known-good only against ddeecfd4ca5664b70b2434a7de99522b7dde658d"
+              echo "::error::(the commit right before upstream's 2026-06-18 sucompat refactor, PR #3521)."
+              echo "::error::If you set ksu_next_ref to something newer, upstream has likely moved"
+              echo "::error::again - check the .rej files in the uploaded patch-rejects artifact,"
+              echo "::error::diff them against the current KernelSU-Next source at that path, and"
+              echo "::error::either re-pin to an older working commit or hand-update the patch."
+              exit 1
+            fi
           else
             echo "No 70_ patch shipped for this combo - skipping."
           fi
@@ -407,7 +430,7 @@ jobs:
             echo "|---|---|"
             echo "| Source branch | \`$PIXEL_MANIFEST_BRANCH\` |"
             echo "| Kernel | ${KERNEL_VER}.${SUBLEVEL:-unknown} |"
-            echo "| KSU variant | KernelSU-Next (${{ inputs.ksu_next_branch }}) |"
+            echo "| KSU variant | KernelSU-Next @ \`${KSU_RESOLVED_COMMIT:-unknown}\` |"
             echo "| Enhanced SUSFS | ${{ inputs.apply_enhanced_susfs }} |"
             echo "| ZeroMount | ${{ inputs.apply_zeromount }} |"
             echo "| KSU safety patch | ${{ inputs.apply_ksu_safety }} |"
