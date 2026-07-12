@@ -1,0 +1,417 @@
+name: "Pixel 9/9Pro/9ProXL (caimito) - KernelSU-Next + SUSFS + ZeroMount"
+
+# WHY THIS WORKFLOW EXISTS (read this before running)
+# ------------------------------------------------------------------
+# Enginex0/Super-Builders builds its kernels from Google's GENERIC ACK
+# common-android14-6.1-* branch. That tree contains no Tensor/Pixel
+# drivers at all - it's the same generic core every GKI device shares.
+# Real Pixel 9 / 9 Pro / 9 Pro XL hardware runs a kernel built from
+# Google's PRIVATE per-device manifest branch instead:
+#
+#     android-gs-caimito-6.1-android16
+#
+# (confirmed current in Google's own "Build Pixel kernels" doc,
+# source.android.com/docs/setup/build/building-pixel-kernels - "caimito"
+# is officially the shared codename for tokay/caiman/komodo, i.e.
+# Pixel 9 / Pixel 9 Pro / Pixel 9 Pro XL). That branch is what actually
+# matches the vendor_dlkm / vendor_kernel_boot modules already on your
+# phone. Building from generic ACK instead is very likely why the
+# Super-Builders output bootloops on Pixel - it's also an open,
+# unresolved issue on that repo (#10, a Pixel 10 Pro user hitting the
+# exact same "compiles fine, doesn't boot" symptom).
+#
+# This workflow keeps Super-Builders' actual patch stack (50/51/60/70)
+# untouched, but applies it on top of the CORRECT Pixel source tree,
+# using Google's own build_caimito.sh (Kleaf/Bazel) instead of a
+# generic build.sh invocation. KPM is never added: it's a SukiSU-Ultra/
+# ReSukiSU-only feature (see Super-Builders' own workflow_dispatch
+# description "Add KPM (SukiSU/ReSukiSU)") - KernelSU-Next has no KPM
+# implementation, so it's simply never referenced here, anywhere.
+#
+# This has been assembled and cross-checked step-by-step against both
+# repos' actual source (not just their READMEs) but has NOT been run
+# end-to-end by an AI, since a full Pixel kernel build needs Google's
+# git servers and 45-90 minutes of CI time. Treat the first result as
+# a release candidate: test-boot with `fastboot boot` before you
+# `fastboot flash` it permanently. See the accompanying chat message
+# for the full recovery/testing checklist.
+# ------------------------------------------------------------------
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_next_branch:
+        description: "KernelSU-Next upstream branch"
+        type: choice
+        options: [stable, dev]
+        default: stable
+      apply_enhanced_susfs:
+        description: "Apply Super-Builders 51_enhanced_susfs patch"
+        type: boolean
+        default: true
+      apply_zeromount:
+        description: "Apply Super-Builders 60_zeromount patch"
+        type: boolean
+        default: true
+      apply_ksu_safety:
+        description: "Apply Super-Builders 70_ksu_safety patch"
+        type: boolean
+        default: true
+      apply_overlayfs_support:
+        description: "Optional: CONFIG_TMPFS_XATTR + POSIX ACL"
+        type: boolean
+        default: false
+      apply_bbg:
+        description: "Optional: Baseband Guard LSM"
+        type: boolean
+        default: false
+      build_signed_bootimg:
+        description: "Also produce a test-signed boot.img for direct fastboot flash"
+        type: boolean
+        default: true
+      superbuilders_ref:
+        description: "Super-Builders git ref to pull patches from (empty = main)"
+        type: string
+        default: ""
+
+env:
+  PIXEL_MANIFEST_BRANCH: android-gs-caimito-6.1-android16
+  ANDROID_VER: android14
+  KERNEL_VER: "6.1"
+  SB_PATCH_DIR: android14-6.1/KernelSU-Next/patches
+  SB_HELPER_DIR: android14-6.1/build-helpers
+  SB_FRAGMENT: android14-6.1/defconfig.fragment
+
+jobs:
+  build:
+    name: "caimito (Pixel 9 / 9 Pro / 9 Pro XL) - KSU-Next + SUSFS + ZeroMount"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ----------------------------------------------------------------
+      # 0. Runner prep - Kleaf/Bazel kernel builds need real disk + swap
+      # ----------------------------------------------------------------
+      - name: Free disk space
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          testing: false
+
+      - name: Add swap for LTO
+        uses: thejerrybao/setup-swap-space@v1
+        with:
+          swap-size-gb: 24
+
+      - name: Install repo tool + toolchain bits
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lld binutils
+
+      # ----------------------------------------------------------------
+      # 1. Pull Super-Builders' patches (we reuse THEIR patch stack -
+      #    we only change what source tree it gets applied to)
+      # ----------------------------------------------------------------
+      - name: Checkout Super-Builders (patch source only)
+        uses: actions/checkout@v4
+        with:
+          repository: Enginex0/Super-Builders
+          ref: ${{ inputs.superbuilders_ref || 'main' }}
+          path: super-builders
+
+      # ----------------------------------------------------------------
+      # 2. Sync the CORRECT, Pixel-specific kernel source.
+      #    This is the actual fix: real Tensor/Pixel drivers + the exact
+      #    KMI the phone's vendor_dlkm / vendor_kernel_boot expects,
+      #    instead of driverless generic ACK.
+      # ----------------------------------------------------------------
+      - name: Sync android-gs-caimito-6.1-android16 (official Pixel 9 source)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/kernel"
+          cd "$GITHUB_WORKSPACE/kernel"
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b "$PIXEL_MANIFEST_BRANCH" --depth=1
+          repo --trace sync -c -j"$(nproc --all)" --fail-fast --no-tags --force-sync --no-clone-bundle
+          echo "KERNEL_ROOT=$GITHUB_WORKSPACE/kernel" >> "$GITHUB_ENV"
+          # NOTE: the gs-caimito manifest checks the ACK/common portion
+          # out to kernel/aosp, NOT kernel/common. Super-Builders' own
+          # scripts assume "common" because they sync generic ACK
+          # directly - every path below is adjusted for "aosp" instead.
+          echo "AOSP_DIR=$GITHUB_WORKSPACE/kernel/aosp" >> "$GITHUB_ENV"
+
+      - name: Report exactly what got synced
+        working-directory: ${{ github.workspace }}/kernel/aosp
+        run: |
+          V=$(grep '^VERSION = '    Makefile | awk '{print $3}')
+          P=$(grep '^PATCHLEVEL = ' Makefile | awk '{print $3}')
+          S=$(grep '^SUBLEVEL = '   Makefile | awk '{print $3}')
+          echo "Synced kernel: $V.$P.$S   (branch: $PIXEL_MANIFEST_BRANCH)"
+          echo "SUBLEVEL=$S" >> "$GITHUB_ENV"
+          echo "### Synced source" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`$PIXEL_MANIFEST_BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Kernel: \`$V.$P.$S\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch AnyKernel3 (GKI 2.0 template)
+        run: |
+          git clone -q -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git "$GITHUB_WORKSPACE/AnyKernel3"
+
+      # ----------------------------------------------------------------
+      # 3. KernelSU-Next - official upstream, same method for either repo
+      # ----------------------------------------------------------------
+      - name: Set up KernelSU-Next
+        working-directory: ${{ github.workspace }}/kernel/aosp
+        run: |
+          BRANCH="${{ inputs.ksu_next_branch || 'stable' }}"
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${BRANCH}/kernel/setup.sh" | bash -s "$BRANCH"
+          test -d KernelSU-Next || { echo "::error::KernelSU-Next/ was not created by setup.sh"; exit 1; }
+          echo "KSU_DIR=$GITHUB_WORKSPACE/kernel/aosp/KernelSU-Next" >> "$GITHUB_ENV"
+          echo "CONFIG_KSU=y" >> "$GITHUB_WORKSPACE/wild_gki.fragment"
+
+      # ----------------------------------------------------------------
+      # 4. Super-Builders' patch stack, applied to the correct tree.
+      #    These patches only touch generic VFS core (fs/*.c, fs/Kconfig,
+      #    fs/Makefile) and KernelSU-Next's own driver files - both are
+      #    shared lineage between generic ACK and gs-caimito, so they
+      #    should apply cleanly. -F3 gives minor fuzz tolerance; any
+      #    .rej gets collected and uploaded later, not silently ignored.
+      # ----------------------------------------------------------------
+      - name: "Patch 50 - base SUSFS (always on - this is the core ask)"
+        working-directory: ${{ github.workspace }}/kernel/aosp
+        run: |
+          patch -p1 -F3 --no-backup-if-mismatch < \
+            "$GITHUB_WORKSPACE/super-builders/$SB_PATCH_DIR/50_add_susfs_in_gki-${ANDROID_VER}-${KERNEL_VER}.patch"
+
+      - name: "Patch 51 - enhanced SUSFS (kstat redirect, unicode filter, etc.)"
+        if: ${{ inputs.apply_enhanced_susfs }}
+        working-directory: ${{ github.workspace }}/kernel/aosp
+        run: |
+          patch -p1 -F3 --no-backup-if-mismatch < \
+            "$GITHUB_WORKSPACE/super-builders/$SB_PATCH_DIR/51_enhanced_susfs-${ANDROID_VER}-${KERNEL_VER}.patch"
+
+      - name: "Patch 60 - ZeroMount VFS engine"
+        if: ${{ inputs.apply_zeromount }}
+        working-directory: ${{ github.workspace }}/kernel/aosp
+        run: |
+          patch -p1 -F3 --no-backup-if-mismatch < \
+            "$GITHUB_WORKSPACE/super-builders/$SB_PATCH_DIR/60_zeromount-${ANDROID_VER}-${KERNEL_VER}.patch"
+
+      - name: "Patch 70 - KernelSU-Next safety/hardening patch"
+        if: ${{ inputs.apply_ksu_safety }}
+        working-directory: ${{ env.KSU_DIR }}
+        run: |
+          PATCH="$GITHUB_WORKSPACE/super-builders/$SB_PATCH_DIR/70_ksu_safety-kernelsu-next-${KERNEL_VER}.patch"
+          if [ -s "$PATCH" ]; then
+            patch -p1 --no-backup-if-mismatch < "$PATCH"
+          else
+            echo "No 70_ patch shipped for this combo - skipping."
+          fi
+
+      # NOTE ON KPM: deliberately no step here. Super-Builders' own
+      # workflow labels "Add KPM" as "(SukiSU/ReSukiSU)" - KernelSU-Next
+      # has no KPM driver code, so there is nothing to add and nothing
+      # to exclude beyond "never write CONFIG_KPM anywhere below."
+
+      # ----------------------------------------------------------------
+      # 5. Optional Super-Builders extras (off by default - enable only
+      #    after your first build boots cleanly, to keep the first
+      #    attempt's variables to a minimum)
+      # ----------------------------------------------------------------
+      - name: "Optional: Baseband Guard"
+        if: ${{ inputs.apply_bbg }}
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          wget -q -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+          echo "CONFIG_BBG=y" >> "$GITHUB_WORKSPACE/wild_gki.fragment"
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' aosp/security/Kconfig
+
+      # ----------------------------------------------------------------
+      # 6. Assemble the defconfig fragment from Super-Builders' own
+      #    fragment file. --susfs is passed; --kpm is NEVER passed.
+      # ----------------------------------------------------------------
+      - name: Assemble defconfig fragment (SUSFS on, KPM never included)
+        run: |
+          FLAGS="--susfs --kleaf"
+          [[ "${{ inputs.apply_overlayfs_support }}" == "true" ]] && FLAGS="$FLAGS --overlayfs"
+
+          bash "$GITHUB_WORKSPACE/super-builders/$SB_HELPER_DIR/assemble-defconfig.sh" \
+            "$GITHUB_WORKSPACE/super-builders/$SB_FRAGMENT" \
+            "$GITHUB_WORKSPACE/wild_gki.fragment" \
+            "$AOSP_DIR/arch/arm64/configs/gki_defconfig" \
+            $FLAGS
+
+          # Defensive belt-and-suspenders: strip CONFIG_KPM if it ever
+          # appears from anywhere, so a future edit can't reintroduce it
+          # silently.
+          sed -i '/CONFIG_KPM/d' "$GITHUB_WORKSPACE/wild_gki.fragment"
+
+      # ----------------------------------------------------------------
+      # 7. Every KernelSU kernel needs this, regardless of source tree -
+      #    KSU's hooks add symbols the frozen KMI export list doesn't
+      #    have, so the build-time protected-exports check must be
+      #    relaxed. This is the SAME step WildKernels' proven Pixel
+      #    pipeline uses - not a Super-Builders-only workaround.
+      # ----------------------------------------------------------------
+      - name: Remove protected-exports enforcement
+        working-directory: ${{ env.AOSP_DIR }}
+        run: |
+          rm -rf android/abi_gki_protected_exports_*
+          perl -pi -e 's/^\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",\s*$//;' BUILD.bazel
+          sed -i 's/protected_modules = \[.*\]/protected_modules = []/' aospodules.bzl 2>/dev/null || true
+
+      - name: Clean dirty version flags
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
+          sed -i 's/-dirty//' aosp/scripts/setlocalversion
+          cd aosp
+          git config --global user.name  "gh-actions[bot]"
+          git config --global user.email "gh-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "wild_gki: clean build flags" || true
+
+      # ----------------------------------------------------------------
+      # 8. Build - Google's own build_caimito.sh (Kleaf/Bazel), exactly
+      #    as documented for this device family, NOT a generic
+      #    build.sh/bazel invocation against a device-less tree.
+      # ----------------------------------------------------------------
+      - name: Build kernel (build_caimito.sh)
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          cp "$GITHUB_WORKSPACE/wild_gki.fragment" aosp/arch/arm64/configs/wild_gki.fragment
+          ./build_caimito.sh --config=release --stamp \
+            --defconfig_fragment=//aosp:arch/arm64/configs/wild_gki.fragment
+
+      - name: Dump build logs on failure
+        if: failure()
+        run: |
+          for LOG in $(find "$KERNEL_ROOT" -name '*.log' -newer "$KERNEL_ROOT/aosp" -type f 2>/dev/null | head -5); do
+            echo "::group::$(basename "$LOG")"
+            tail -100 "$LOG"
+            echo "::endgroup::"
+          done
+
+      # ----------------------------------------------------------------
+      # 9. Package output two ways: AnyKernel3 zip (flash via Kernel
+      #    Flasher / Horizon Kernel Flasher app) AND a directly
+      #    fastboot-flashable, test-signed boot.img, since Pixel's
+      #    boot.img on this device family contains only the kernel
+      #    (no ramdisk) - a raw, correctly-headered image sidesteps any
+      #    AnyKernel3 packaging quirks entirely as a second option.
+      # ----------------------------------------------------------------
+      - name: Locate built Image
+        run: |
+          IMG=$(find "$KERNEL_ROOT/out" -name Image -type f 2>/dev/null | head -1)
+          if [ -z "$IMG" ]; then
+            IMG=$(find "$KERNEL_ROOT/bazel-bin" -name Image -type f 2>/dev/null | head -1)
+          fi
+          [ -n "$IMG" ] || { echo "::error::Built Image not found anywhere under out/ or bazel-bin/"; exit 1; }
+          echo "BUILT_IMAGE=$IMG" >> "$GITHUB_ENV"
+          echo "FILE_NAME=caimito-${KERNEL_VER}.${SUBLEVEL}-KSUN-SUSFS-ZeroMount" >> "$GITHUB_ENV"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          cp "$BUILT_IMAGE" "$GITHUB_WORKSPACE/AnyKernel3/Image"
+
+      - name: Build test-signed boot.img (direct fastboot flash option)
+        if: ${{ inputs.build_signed_bootimg }}
+        run: |
+          git clone -q --depth 1 -b main-kernel-2025 https://android.googlesource.com/kernel/prebuilts/build-tools kernel-build-tools
+          git clone -q --depth 1 -b main-kernel-2025 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg-tools
+
+          mkdir -p "$GITHUB_WORKSPACE/avb-key"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "$GITHUB_WORKSPACE/avb-key/testkey_rsa2048.pem"
+
+          mkdir -p out-bootimg
+          python3 mkbootimg-tools/mkbootimg.py \
+            --header_version 4 \
+            --kernel "$BUILT_IMAGE" \
+            --output "out-bootimg/${FILE_NAME}-boot.img"
+
+          kernel-build-tools/linux-x86/bin/avbtool add_hash_footer \
+            --partition_name boot \
+            --partition_size $((64 * 1024 * 1024)) \
+            --image "out-bootimg/${FILE_NAME}-boot.img" \
+            --algorithm SHA256_RSA2048 \
+            --key "$GITHUB_WORKSPACE/avb-key/testkey_rsa2048.pem"
+
+          echo "::notice::This boot.img is TEST-SIGNED, not signed with Google's real key." \
+               "That's expected and fine on an unlocked bootloader (same as any custom" \
+               "kernel/Magisk/KSU patched image) - you'll see the orange 'can't check for" \
+               "corruption' warning for a few seconds, then it boots normally."
+
+      # ----------------------------------------------------------------
+      # 10. Collect any patch rejects so a failure is debuggable instead
+      #     of a silent dead end.
+      # ----------------------------------------------------------------
+      - name: Scan for patch rejects
+        if: always()
+        run: |
+          REJDIR="$GITHUB_WORKSPACE/patch-rejects"
+          mkdir -p "$REJDIR"
+          mapfile -t REJS < <(find "$KERNEL_ROOT" -type f -name '*.rej' 2>/dev/null)
+          echo "REJ_COUNT=${#REJS[@]}" >> "$GITHUB_ENV"
+          for REJ in "${REJS[@]:-}"; do
+            [ -z "$REJ" ] && continue
+            REL="${REJ#"$KERNEL_ROOT"/}"
+            DEST="$REJDIR/$REL"
+            mkdir -p "$(dirname "$DEST")"
+            cp "$REJ" "$DEST"
+          done
+
+      - name: Upload AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ env.FILE_NAME }}-AnyKernel3"
+          path: AnyKernel3/**
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: Upload test-signed boot.img
+        if: ${{ inputs.build_signed_bootimg }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ env.FILE_NAME }}-boot-img"
+          path: out-bootimg/*.img
+          if-no-files-found: error
+
+      - name: Upload patch rejects (only present if something needed attention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ env.FILE_NAME }}-patch-rejects"
+          path: patch-rejects/
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## caimito (Pixel 9 / 9 Pro / 9 Pro XL) build"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Source branch | \`$PIXEL_MANIFEST_BRANCH\` |"
+            echo "| Kernel | ${KERNEL_VER}.${SUBLEVEL:-unknown} |"
+            echo "| KSU variant | KernelSU-Next (${{ inputs.ksu_next_branch }}) |"
+            echo "| Enhanced SUSFS | ${{ inputs.apply_enhanced_susfs }} |"
+            echo "| ZeroMount | ${{ inputs.apply_zeromount }} |"
+            echo "| KSU safety patch | ${{ inputs.apply_ksu_safety }} |"
+            echo "| KPM | never applicable to KernelSU-Next |"
+            echo "| Patch rejects | ${REJ_COUNT:-0} |"
+            echo "| Signed boot.img built | ${{ inputs.build_signed_bootimg }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
